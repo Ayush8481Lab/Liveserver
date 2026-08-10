@@ -37,23 +37,73 @@ function generateGuestToken() {
            substr($bin, 20);
 }
 
-// MODIFIED: Only accepts the token dynamically from the URL, skips page parsing completely.
-function fetchPlatformToken() {
-    if (isset($_GET['tok']) && !empty($_GET['tok'])) {
-        return $_GET['tok'];
+// 1. Scrape and Cache the Platform Token (Updates every 10 mins)
+function fetchCachedPlatformToken() {
+    $cacheFile = 'token_cache.json';
+    $cacheTime = 600; // 10 minutes in seconds
+
+    // Check if cache exists and is newer than 10 minutes
+    if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < $cacheTime) {
+        $cacheData = json_decode(file_get_contents($cacheFile), true);
+        if (!empty($cacheData['token'])) {
+            return $cacheData['token'];
+        }
     }
-    
-    // If no token is provided in the URL, stop execution and show this error.
-    echo json_encode(["error" => "Missing gwapiPlatformToken. Please pass it in the URL like: This.php?tok=YOUR_TOKEN_HERE"]);
+
+    // If cache is expired or missing, scrape the Zee News page again
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => 'https://www.zee5.com/live-tv/zee-news/0-9-zeenews',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+            'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language: en-US,en;q=0.9'
+        ]
+    ]);
+    $html = curl_exec($ch);
+    curl_close($ch);
+
+    if (preg_match('/"gwapiPlatformToken"\s*:\s*"([^"]+)"/', $html, $matches)) {
+        $token = $matches[1];
+        // Save the new token to the cache file
+        file_put_contents($cacheFile, json_encode(['token' => $token]));
+        return $token;
+    }
+
+    echo json_encode(["error" => "Failed to scrape gwapiPlatformToken from Zee News webpage. IP might be blocked."]);
     exit;
 }
 
-function fetchM3U8url() {
-    $guestToken = generateGuestToken();
-    $platformToken = fetchPlatformToken();
+// 2. Fetch the Base HLS URL for the requested Channel ID using Catalog API
+function fetchCatalogBaseUrl($id) {
+    $url = "https://catalogapi.zee5.com/v1/channel/{$id}?translation=en&country=IN";
     
     $ch = curl_init();
     curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
+    ]);
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
+    $data = json_decode($response, true);
+    if (isset($data['stream_url_hls']) && !empty($data['stream_url_hls'])) {
+        return $data['stream_url_hls'];
+    }
+    
+    echo json_encode(["error" => "Failed to find stream_url_hls in Catalog API for requested ID: $id"]);
+    exit;
+}
+
+// 3. Generate a Free Token by hitting SPAPI using Zee News default channel
+function fetchZeeNewsTokenizedUrl($platformToken) {
+    $guestToken = generateGuestToken();
+    
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        // Hardcoded to 0-9-zeenews to bypass premium checks and get a free CDN token
         CURLOPT_URL => 'https://spapi.zee5.com/singlePlayback/getDetails/secure?channel_id=0-9-zeenews&device_id=' . $guestToken . '&platform_name=desktop_web&translation=en&user_language=en,hi,te&country=IN&state=&app_version=4.24.0&user_type=guest&check_parental_control=false',
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CUSTOMREQUEST => 'POST',
@@ -62,7 +112,7 @@ function fetchM3U8url() {
             'content-type: application/json',
             'origin: https://www.zee5.com',
             'referer: https://www.zee5.com/',
-            'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
+            'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         ],
         CURLOPT_POSTFIELDS => json_encode([
             'x-access-token' => $platformToken,
@@ -75,34 +125,44 @@ function fetchM3U8url() {
     curl_close($ch);
     $responseData = json_decode($response, true);
     
-    if (!$responseData) {
-        echo json_encode(["error" => "Invalid response received from API. IP is likely blocked."]);
-        exit;
-    }
-
     if (isset($responseData['keyOsDetails']['video_token'])) {
-        if (!filter_var($responseData['keyOsDetails']['video_token'], FILTER_VALIDATE_URL)) {
-            echo json_encode(["error" => "Invalid URL received."]);
-            exit;
-        }
-        return [
-            'm3u8_url' => $responseData['keyOsDetails']['video_token'],
-            'post_api_response' => $responseData 
-        ];
-    } else {
-        echo json_encode(["error" => "Could not fetch m3u8 URL", "raw_response" => $responseData]);
-        exit;
+        return $responseData['keyOsDetails']['video_token'];
     }
+    
+    echo json_encode(["error" => "Could not fetch SPAPI token using Zee News", "raw_response" => $responseData]);
+    exit;
 }
 
-function generateCookieZee5($userAgent) {
-    $fetchedData = fetchM3U8url();
-    $m3u8Url = $fetchedData['m3u8_url'];
-    $apiResponse = $fetchedData['post_api_response'];
+// Main logic building everything together
+function buildFinalData($userAgent) {
+    // Get requested ID from URL (e.g. ?id=0-9-zeeanmol), fallback to zeeanmol if none provided
+    $req_id = isset($_GET['id']) && !empty($_GET['id']) ? $_GET['id'] : '0-9-zeeanmol';
     
+    // Step 1: Get Cached Platform Token
+    $platformToken = fetchCachedPlatformToken();
+    
+    // Step 2: Get the Base Master M3U8 URL for the requested channel
+    $baseUrl = fetchCatalogBaseUrl($req_id);
+    
+    // Step 3: Get the Tokenized Zee News URL
+    $zeeNewsTokenizedUrl = fetchZeeNewsTokenizedUrl($platformToken);
+    
+    // Step 4: Extract the token query string and merge it with the Base URL
+    $parsedUrl = parse_url($zeeNewsTokenizedUrl);
+    $queryString = isset($parsedUrl['query']) ? $parsedUrl['query'] : '';
+    
+    if (empty($queryString)) {
+        echo json_encode(["error" => "No token query found in the Zee News SPAPI response."]);
+        exit;
+    }
+    
+    $separator = (strpos($baseUrl, '?') !== false) ? '&' : '?';
+    $finalM3u8Url = $baseUrl . $separator . $queryString;
+    
+    // Step 5: Process exactly as it was (Extract Cookie from final URL if possible)
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL => $m3u8Url,
+        CURLOPT_URL => $finalM3u8Url,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_USERAGENT => $userAgent,
         CURLOPT_FOLLOWLOCATION => true
@@ -111,28 +171,24 @@ function generateCookieZee5($userAgent) {
     $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
     
-    if ($httpcode !== 200) {
-        echo json_encode(["error" => "Required hdntl token can't be extracted. IP blocked at Akamai CDN level."]);
-        exit;
+    $extractedCookie = "Not found or IP blocked at CDN level.";
+    if ($httpcode === 200 && preg_match('/hdntl=([^\s"]+)/', $result, $matches)) {
+        $extractedCookie = $matches[0];
     }
     
-    if (preg_match('/hdntl=([^\s"]+)/', $result, $matches)) {
-        return [
-            'status' => 'success',
-            'extracted_cookie' => $matches[0],
-            'm3u8_master_url' => $m3u8Url,
-            'zee5_api_response' => $apiResponse 
-        ];
-    }
-    
-    echo json_encode(["error" => "Something went wrong. hdntl cookie not found in the m3u8 text."]);
-    exit;
+    // Return all data
+    return [
+        'status' => 'success',
+        'requested_channel' => $req_id,
+        'catalog_base_url' => $baseUrl,
+        'constructed_master_m3u8' => $finalM3u8Url,
+        'extracted_cookie' => $extractedCookie
+    ];
 }
 
 // === EXECUTION BLOCK ===
 $userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36';
-
-$finalOutput = generateCookieZee5($userAgent);
+$finalOutput = buildFinalData($userAgent);
 
 echo json_encode($finalOutput, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
 exit;
