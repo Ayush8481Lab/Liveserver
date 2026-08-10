@@ -37,12 +37,17 @@ function generateGuestToken() {
            substr($bin, 20);
 }
 
-// 1. Scrape and Cache the Platform Token (Updates every 10 mins)
+// 1. Scrape and Cache the Platform Token (Optimized for Render)
 function fetchCachedPlatformToken() {
-    $cacheFile = 'token_cache.json';
-    $cacheTime = 600; // 10 minutes in seconds
+    // FALLBACK: If Render gets IP blocked, you can manually pass ?tok=YOUR_TOKEN
+    if (isset($_GET['tok']) && !empty($_GET['tok'])) {
+        return $_GET['tok'];
+    }
 
-    // Check if cache exists and is newer than 10 minutes
+    // Render-safe temp directory for caching (Updates every 10 mins)
+    $cacheFile = sys_get_temp_dir() . '/zee5_token_cache.json';
+    $cacheTime = 600; // 10 minutes
+
     if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < $cacheTime) {
         $cacheData = json_decode(file_get_contents($cacheFile), true);
         if (!empty($cacheData['token'])) {
@@ -50,28 +55,39 @@ function fetchCachedPlatformToken() {
         }
     }
 
-    // If cache is expired or missing, scrape the Zee News page again
+    // Advanced cURL to bypass Akamai on Render (Looks exactly like Chrome)
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL => 'https://www.zee5.com/live-tv/zee-news/0-9-zeenews',
         CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_ENCODING => '', // Crucial for WAF bypass: Accepts GZIP/Deflate
         CURLOPT_HTTPHEADER => [
             'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
-            'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language: en-US,en;q=0.9'
+            'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language: en-US,en;q=0.9',
+            'Connection: keep-alive',
+            'Upgrade-Insecure-Requests: 1',
+            'Sec-Fetch-Dest: document',
+            'Sec-Fetch-Mode: navigate',
+            'Sec-Fetch-Site: none',
+            'Sec-Fetch-User: ?1'
         ]
     ]);
     $html = curl_exec($ch);
+    $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    if (preg_match('/"gwapiPlatformToken"\s*:\s*"([^"]+)"/', $html, $matches)) {
+    if ($httpcode === 200 && preg_match('/"gwapiPlatformToken"\s*:\s*"([^"]+)"/', $html, $matches)) {
         $token = $matches[1];
-        // Save the new token to the cache file
         file_put_contents($cacheFile, json_encode(['token' => $token]));
         return $token;
     }
 
-    echo json_encode(["error" => "Failed to scrape gwapiPlatformToken from Zee News webpage. IP might be blocked."]);
+    // Error handler specific to Render environments
+    echo json_encode([
+        "error" => "Render Server IP is blocked by Zee5 WAF from scraping the HTML page.", 
+        "solution" => "Use the fallback method: pass the token manually in the URL like /?id=0-9-zeeanmol&tok=YOUR_TOKEN"
+    ]);
     exit;
 }
 
@@ -83,7 +99,8 @@ function fetchCatalogBaseUrl($id) {
     curl_setopt_array($ch, [
         CURLOPT_URL => $url,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
+        CURLOPT_ENCODING => '',
+        CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
     ]);
     $response = curl_exec($ch);
     curl_close($ch);
@@ -93,7 +110,7 @@ function fetchCatalogBaseUrl($id) {
         return $data['stream_url_hls'];
     }
     
-    echo json_encode(["error" => "Failed to find stream_url_hls in Catalog API for requested ID: $id"]);
+    echo json_encode(["error" => "Failed to find stream_url_hls in Catalog API for requested ID: $id", "raw_response" => $data]);
     exit;
 }
 
@@ -103,16 +120,16 @@ function fetchZeeNewsTokenizedUrl($platformToken) {
     
     $ch = curl_init();
     curl_setopt_array($ch, [
-        // Hardcoded to 0-9-zeenews to bypass premium checks and get a free CDN token
         CURLOPT_URL => 'https://spapi.zee5.com/singlePlayback/getDetails/secure?channel_id=0-9-zeenews&device_id=' . $guestToken . '&platform_name=desktop_web&translation=en&user_language=en,hi,te&country=IN&state=&app_version=4.24.0&user_type=guest&check_parental_control=false',
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CUSTOMREQUEST => 'POST',
+        CURLOPT_ENCODING => '',
         CURLOPT_HTTPHEADER => [
             'accept: application/json',
             'content-type: application/json',
             'origin: https://www.zee5.com',
             'referer: https://www.zee5.com/',
-            'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
         ],
         CURLOPT_POSTFIELDS => json_encode([
             'x-access-token' => $platformToken,
@@ -129,25 +146,25 @@ function fetchZeeNewsTokenizedUrl($platformToken) {
         return $responseData['keyOsDetails']['video_token'];
     }
     
-    echo json_encode(["error" => "Could not fetch SPAPI token using Zee News", "raw_response" => $responseData]);
+    echo json_encode(["error" => "Could not fetch SPAPI token using Zee News. Render IP might be blocked by SPAPI.", "raw_response" => $responseData]);
     exit;
 }
 
 // Main logic building everything together
 function buildFinalData($userAgent) {
-    // Get requested ID from URL (e.g. ?id=0-9-zeeanmol), fallback to zeeanmol if none provided
+    // Get requested ID from URL, default to zeeanmol
     $req_id = isset($_GET['id']) && !empty($_GET['id']) ? $_GET['id'] : '0-9-zeeanmol';
     
     // Step 1: Get Cached Platform Token
     $platformToken = fetchCachedPlatformToken();
     
-    // Step 2: Get the Base Master M3U8 URL for the requested channel
+    // Step 2: Get the Base Master M3U8 URL
     $baseUrl = fetchCatalogBaseUrl($req_id);
     
     // Step 3: Get the Tokenized Zee News URL
     $zeeNewsTokenizedUrl = fetchZeeNewsTokenizedUrl($platformToken);
     
-    // Step 4: Extract the token query string and merge it with the Base URL
+    // Step 4: Extract token query string and merge
     $parsedUrl = parse_url($zeeNewsTokenizedUrl);
     $queryString = isset($parsedUrl['query']) ? $parsedUrl['query'] : '';
     
@@ -159,13 +176,14 @@ function buildFinalData($userAgent) {
     $separator = (strpos($baseUrl, '?') !== false) ? '&' : '?';
     $finalM3u8Url = $baseUrl . $separator . $queryString;
     
-    // Step 5: Process exactly as it was (Extract Cookie from final URL if possible)
+    // Step 5: Process to extract cookie
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL => $finalM3u8Url,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_USERAGENT => $userAgent,
-        CURLOPT_FOLLOWLOCATION => true
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_ENCODING => ''
     ]);
     $result = curl_exec($ch);
     $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
