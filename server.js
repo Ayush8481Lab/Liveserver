@@ -1,115 +1,139 @@
-import express from 'express';
-import puppeteer from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import crypto from 'crypto';
+<?php
+// Set header so the browser/client reads the output as JSON
+header('Content-Type: application/json');
 
-// Activate the stealth plugin
-puppeteer.use(StealthPlugin());
+function generateDDToken() {
+    return base64_encode(json_encode([
+        'schema_version' => '1',
+        'os_name' => 'N/A',
+        'os_version' => 'N/A',
+        'platform_name' => 'Chrome',
+        'platform_version' => '104',
+        'device_name' => '',
+        'app_name' => 'Web',
+        'app_version' => '2.52.31',
+        'player_capabilities' => [
+            'audio_channel' => ['STEREO'],
+            'video_codec' => ['H264'],
+            'container' => ['MP4', 'TS'],
+            'package' => ['DASH', 'HLS'],
+            'resolution' => ['240p', 'SD', 'HD', 'FHD'],
+            'dynamic_range' => ['SDR']
+        ],
+        'security_capabilities' => [
+            'encryption' => ['WIDEVINE_AES_CTR'],
+            'widevine_security_level' => ['L3'],
+            'hdcp_version' => ['HDCP_V1', 'HDCP_V2', 'HDCP_V2_1', 'HDCP_V2_2']
+        ]
+    ]));
+}
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+function generateGuestToken() {
+    $bin = bin2hex(random_bytes(16));
+    return substr($bin, 0, 8) . '-' .
+           substr($bin, 8, 4) . '-' .
+           substr($bin, 12, 4) . '-' .
+           substr($bin, 16, 4) . '-' .
+           substr($bin, 20);
+}
 
-app.get('/api/cap', async (req, res) => {
-  const url = req.query.url;
-  const wait = req.query.wait ? parseInt(req.query.wait) : 5;
-
-  if (!url) {
-    return res.status(400).json({ error: "Please provide a URL." });
-  }
-
-  let browser = null;
-  try {
-    // Launch standard puppeteer (Docker will provide the executable path)
-    browser = await puppeteer.launch({
-      headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-dev-shm-usage' // Crucial for Docker/Render environments
-      ]
-    });
-
-    const page = await browser.newPage();
+// MODIFIED: Only accepts the token dynamically from the URL, skips page parsing completely.
+function fetchPlatformToken() {
+    if (isset($_GET['tok']) && !empty($_GET['tok'])) {
+        return $_GET['tok'];
+    }
     
-    // 1. SET REAL USER AGENT
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36');
+    // If no token is provided in the URL, stop execution and show this error.
+    echo json_encode(["error" => "Missing gwapiPlatformToken. Please pass it in the URL like: This.php?tok=YOUR_TOKEN_HERE"]);
+    exit;
+}
 
-    // 2. STEALTH: Remove webdriver (StealthPlugin handles this, but keeping your manual override just in case)
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    });
+function fetchM3U8url() {
+    $guestToken = generateGuestToken();
+    $platformToken = fetchPlatformToken();
+    
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => 'https://spapi.zee5.com/singlePlayback/getDetails/secure?channel_id=0-9-9z583538&device_id=' . $guestToken . '&platform_name=desktop_web&translation=en&user_language=en,hi,te&country=IN&state=&app_version=4.24.0&user_type=guest&check_parental_control=false',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CUSTOMREQUEST => 'POST',
+        CURLOPT_HTTPHEADER => [
+            'accept: application/json',
+            'content-type: application/json',
+            'origin: https://www.zee5.com',
+            'referer: https://www.zee5.com/',
+            'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
+        ],
+        CURLOPT_POSTFIELDS => json_encode([
+            'x-access-token' => $platformToken,
+            'X-Z5-Guest-Token' => $guestToken,
+            'x-dd-token' => generateDDToken()
+        ])
+    ]);
+    
+    $response = curl_exec($ch);
+    curl_close($ch);
+    $responseData = json_decode($response, true);
+    
+    if (!$responseData) {
+        echo json_encode(["error" => "Invalid response received from API. IP is likely blocked."]);
+        exit;
+    }
 
-    const networkLogs = [];
-    const generateHash = (data) => crypto.createHash('sha256').update(data).digest('hex');
-
-    // Deep Network Listener
-    page.on('response', async (response) => {
-      try {
-        const request = response.request();
-        
-        const logEntry = {
-          url: response.url(),
-          method: request.method(),
-          type: request.resourceType(),
-          status: response.status(),
-          requestHeaders: request.headers(), 
-          responseHeaders: response.headers(), 
-          sha256Hash: "n/a"
-        };
-
-        try { logEntry.hash = new URL(response.url()).hash; } catch (e) { logEntry.hash = ""; }
-
-        if (response.status() < 300 || response.status() >= 400) {
-          if (!['image', 'media', 'font'].includes(request.resourceType())) {
-            const buffer = await response.buffer().catch(() => null);
-            if (buffer) {
-              logEntry.sha256Hash = generateHash(buffer);
-            }
-          }
+    if (isset($responseData['keyOsDetails']['video_token'])) {
+        if (!filter_var($responseData['keyOsDetails']['video_token'], FILTER_VALIDATE_URL)) {
+            echo json_encode(["error" => "Invalid URL received."]);
+            exit;
         }
-        networkLogs.push(logEntry);
-      } catch (err) {
-        // Silently skip
-      }
-    });
+        return [
+            'm3u8_url' => $responseData['keyOsDetails']['video_token'],
+            'post_api_response' => $responseData 
+        ];
+    } else {
+        echo json_encode(["error" => "Could not fetch m3u8 URL", "raw_response" => $responseData]);
+        exit;
+    }
+}
 
-    // 3. BYPASS CHALLENGE: Navigate and wait
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+function generateCookieZee5($userAgent) {
+    $fetchedData = fetchM3U8url();
+    $m3u8Url = $fetchedData['m3u8_url'];
+    $apiResponse = $fetchedData['post_api_response'];
+    
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $m3u8Url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_USERAGENT => $userAgent,
+        CURLOPT_FOLLOWLOCATION => true
+    ]);
+    $result = curl_exec($ch);
+    $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    
+    if ($httpcode !== 200) {
+        echo json_encode(["error" => "Required hdntl token can't be extracted. IP blocked at Akamai CDN level."]);
+        exit;
+    }
+    
+    if (preg_match('/hdntl=([^\s"]+)/', $result, $matches)) {
+        return [
+            'status' => 'success',
+            'extracted_cookie' => $matches[0],
+            'm3u8_master_url' => $m3u8Url,
+            'zee5_api_response' => $apiResponse 
+        ];
+    }
+    
+    echo json_encode(["error" => "Something went wrong. hdntl cookie not found in the m3u8 text."]);
+    exit;
+}
 
-    // Extra wait for challenges
-    await new Promise(resolve => setTimeout(resolve, wait * 1000));
+// === EXECUTION BLOCK ===
+$userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36';
 
-    // Final Capture
-    const finalUrl = page.url();
-    const htmlContent = await page.content();
-    const pageSha256 = generateHash(htmlContent);
+$finalOutput = generateCookieZee5($userAgent);
 
-    let finalUrlFragment = "";
-    try { finalUrlFragment = new URL(finalUrl).hash; } catch (e) { finalUrlFragment = ""; }
-
-    await browser.close();
-
-    return res.status(200).json({
-      target_url: url,
-      final_url: finalUrl,
-      url_fragment: finalUrlFragment,
-      page_sha256Hash: pageSha256,
-      waited_seconds: wait,
-      total_requests: networkLogs.length,
-      logs: networkLogs
-    });
-
-  } catch (error) {
-    if (browser) await browser.close();
-    return res.status(500).json({ 
-      error: "Bypass failed or timeout", 
-      details: error.message
-    });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+echo json_encode($finalOutput, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+exit;
+?>
