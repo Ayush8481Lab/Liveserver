@@ -1,14 +1,21 @@
 <?php
 header('Content-Type: application/json');
 
-// Path to the local cache file (writable by the web server on Render)
+/* ─── Configuration ─── */
 define('TOKEN_CACHE_FILE', __DIR__ . '/token_cache.json');
-// Refresh interval in seconds (10 minutes)
-define('TOKEN_REFRESH_INTERVAL', 600);
+define('TOKEN_REFRESH_INTERVAL', 600); // 10 minutes
 
-/**
- * Generates the dd token used in the Playback Details API.
- */
+/* ─── Helper: generate a random UUID v4 ─── */
+function generateUUID() {
+    $data = random_bytes(16);
+    // Set version 4 (random)
+    $data[6] = chr(ord($data[6]) & 0x0f | 0x40);
+    // Set variant bits
+    $data[8] = chr(ord($data[8]) & 0x3f | 0x80);
+    return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+}
+
+/* ─── Generate dd token (unchanged) ─── */
 function generateDDToken() {
     return base64_encode(json_encode([
         'schema_version'       => '1',
@@ -35,28 +42,12 @@ function generateDDToken() {
     ]));
 }
 
-/**
- * Generates a random guest token in UUID-like format.
- */
-function generateGuestToken() {
-    $bin = bin2hex(random_bytes(16));
-    return substr($bin, 0, 8) . '-' .
-           substr($bin, 8, 4) . '-' .
-           substr($bin, 12, 4) . '-' .
-           substr($bin, 16, 4) . '-' .
-           substr($bin, 20);
-}
-
-/**
- * Returns a valid platform token, refreshing it automatically when needed.
- * Uses a file-based cache to avoid unnecessary API calls.
- */
+/* ─── Platform token management (external API + file cache) ─── */
 function getPlatformToken() {
-    // Check if a fresh cached token exists
+    // If a fresh cached token exists, use it
     if (file_exists(TOKEN_CACHE_FILE)) {
         $cacheTime = filemtime(TOKEN_CACHE_FILE);
         if ((time() - $cacheTime) < TOKEN_REFRESH_INTERVAL) {
-            // Token is still fresh
             $data = json_decode(file_get_contents(TOKEN_CACHE_FILE), true);
             if (isset($data['token']) && !empty($data['token'])) {
                 return $data['token'];
@@ -64,18 +55,19 @@ function getPlatformToken() {
         }
     }
 
-    // Token missing or expired – fetch a new one
+    // Fetch a new token from the external API
     $token = fetchTokenFromApi();
 
-    // If fetching failed but we have an old token, use it as fallback
+    // Fallback: if API fails but old token exists, use it
     if (!$token && file_exists(TOKEN_CACHE_FILE)) {
         $data = json_decode(file_get_contents(TOKEN_CACHE_FILE), true);
         if (isset($data['token'])) {
-            return $data['token']; // stale but better than nothing
+            return $data['token'];
         }
     }
 
     if (!$token) {
+        http_response_code(502);
         echo json_encode(["error" => "Unable to obtain platform token from API."]);
         exit;
     }
@@ -83,17 +75,13 @@ function getPlatformToken() {
     return $token;
 }
 
-/**
- * Fetches a new platform token from the external API.
- * Returns the token string on success, or null on failure.
- */
 function fetchTokenFromApi() {
     $ch = curl_init('https://jiotvegp.vercel.app/api/token');
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT        => 10,
         CURLOPT_HTTPHEADER     => ['Accept: application/json'],
-        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     ]);
     $response = curl_exec($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -104,9 +92,9 @@ function fetchTokenFromApi() {
     }
 
     $data = json_decode($response, true);
-    if (isset($data['success']) && $data['success'] === true && isset($data['token'])) {
+    if (isset($data['success'], $data['token']) && $data['success'] === true) {
         $token = $data['token'];
-        // Save to cache file (use file locking to avoid race conditions)
+        // Save to cache (with file locking)
         $fp = fopen(TOKEN_CACHE_FILE, 'c+');
         if ($fp && flock($fp, LOCK_EX)) {
             ftruncate($fp, 0);
@@ -120,16 +108,34 @@ function fetchTokenFromApi() {
     return null;
 }
 
-/**
- * Fetches the m3u8 URL from Zee5 API using the latest platform token.
- */
-function fetchM3U8url() {
-    $guestToken    = generateGuestToken();
+/* ─── Fetch M3U8 URL using NEW mobile_web API parameters ─── */
+function fetchM3U8url($channelId) {
+    $deviceId   = generateUUID();          // proper UUID
+    $guestToken = $deviceId;               // can be same or separate; here we reuse
     $platformToken = getPlatformToken();
+
+    $queryParams = http_build_query([
+        'channel_id'              => $channelId,
+        'device_id'               => $deviceId,
+        'platform_name'           => 'mobile_web',
+        'translation'             => 'en',
+        'user_language'           => 'en,hi,hr,mr',
+        'country'                 => 'IN',
+        'state'                   => '',          // leave empty (or use 'RJ' if needed)
+        'app_version'             => '6.5.12',
+        'user_type'               => 'guest',
+        'check_parental_control'  => 'false',
+        'uid'                     => 'Z5X_' . $deviceId,
+        'ppid'                    => $deviceId,
+        'version'                 => '15',
+        'os'                      => 'android'
+    ]);
+
+    $url = 'https://spapi.zee5.com/singlePlayback/getDetails/secure?' . $queryParams;
 
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL => 'https://spapi.zee5.com/singlePlayback/getDetails/secure?channel_id=0-9-zeetv&device_id=' . $guestToken . '&platform_name=mobile_web&translation=en&user_language=en,hi,hr,mr&country=IN&state=RJ&app_version=6.5.12&user_type=guest&check_parental_control=false&uid=Z5X_e136a4b4-b083-494d-8c23-af9dd2294f50&ppid=e136a4b4-b083-494d-8c23-af9dd2294f50&version=15&os=android,
+        CURLOPT_URL            => $url,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CUSTOMREQUEST  => 'POST',
         CURLOPT_HTTPHEADER     => [
@@ -140,50 +146,43 @@ function fetchM3U8url() {
             'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
         ],
         CURLOPT_POSTFIELDS => json_encode([
-            'x-access-token'     => $platformToken,
-            'X-Z5-Guest-Token'   => $guestToken,
-            'x-dd-token'         => generateDDToken()
+            'x-access-token'   => $platformToken,
+            'X-Z5-Guest-Token' => $guestToken,
+            'x-dd-token'       => generateDDToken()
         ])
     ]);
 
     $response = curl_exec($ch);
     curl_close($ch);
-    $responseData = json_decode($response, true);
+    $data = json_decode($response, true);
 
-    if (!$responseData) {
-        echo json_encode(["error" => "Invalid response received from API. IP is likely blocked."]);
+    if (!$data) {
+        http_response_code(502);
+        echo json_encode(["error" => "Invalid response from Zee5 API."]);
         exit;
     }
 
-    if (isset($responseData['keyOsDetails']['video_token'])) {
-        if (!filter_var($responseData['keyOsDetails']['video_token'], FILTER_VALIDATE_URL)) {
-            echo json_encode(["error" => "Invalid URL received."]);
-            exit;
-        }
-        return [
-            'm3u8_url'          => $responseData['keyOsDetails']['video_token'],
-            'post_api_response' => $responseData
-        ];
+    if (isset($data['keyOsDetails']['video_token'])) {
+        return $data['keyOsDetails']['video_token'];
     } else {
-        echo json_encode(["error" => "Could not fetch m3u8 URL", "raw_response" => $responseData]);
+        http_response_code(500);
+        echo json_encode([
+            "error" => "Could not fetch M3U8 URL",
+            "raw_response" => $data
+        ]);
         exit;
     }
 }
 
-/**
- * Extracts the hdntl cookie from the m3u8 master playlist.
- */
-function generateCookieZee5() {
-    $userAgent   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36';
-    $fetchedData = fetchM3U8url();
-    $m3u8Url     = $fetchedData['m3u8_url'];
-    $apiResponse = $fetchedData['post_api_response'];
+/* ─── Extract Akamai token from M3U8 ─── */
+function generateCookieZee5($channelId) {
+    $m3u8Url = fetchM3U8url($channelId);
 
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL            => $m3u8Url,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_USERAGENT      => $userAgent,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         CURLOPT_FOLLOWLOCATION => true
     ]);
     $result   = curl_exec($ch);
@@ -191,24 +190,39 @@ function generateCookieZee5() {
     curl_close($ch);
 
     if ($httpcode !== 200) {
-        echo json_encode(["error" => "Required hdntl token can't be extracted. IP blocked at Akamai CDN level."]);
+        http_response_code(502);
+        echo json_encode(["error" => "Failed to fetch M3U8. CDN blocked or token expired."]);
         exit;
     }
 
-    if (preg_match('/hdntl=([^\s"]+)/', $result, $matches)) {
+    // Look for hdntl or hdnea token
+    if (preg_match('/(hdntl|hdnea)=([^\s"]+)/', $result, $matches)) {
+        $tokenKey   = $matches[1];
+        $tokenValue = $matches[2];
+        $fullCookie = $tokenKey . '=' . $tokenValue;
+
         return [
             'status'           => 'success',
-            'extracted_cookie' => $matches[0],
+            'extracted_cookie' => $fullCookie,
+            'playable_url'     => $m3u8Url . '?' . $fullCookie,
             'm3u8_master_url'  => $m3u8Url,
-            'zee5_api_response'=> $apiResponse
+            'token_type'       => $tokenKey
         ];
     }
 
-    echo json_encode(["error" => "Something went wrong. hdntl cookie not found in the m3u8 text."]);
+    http_response_code(500);
+    echo json_encode(["error" => "Akamai token not found in M3U8."]);
     exit;
 }
 
-// === Execution ===
-$finalOutput = generateCookieZee5();
-echo json_encode($finalOutput, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+/* ─── Main Execution ─── */
+$channelId = $_GET['id'] ?? null;
+if (!$channelId) {
+    http_response_code(400);
+    echo json_encode(["error" => "Channel ID is required. Usage: ?id=0-9-zeetv"]);
+    exit;
+}
+
+$final = generateCookieZee5($channelId);
+echo json_encode($final, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
 exit;
