@@ -129,7 +129,7 @@ function fetchM3U8url() {
 
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL => 'https://spapi.zee5.com/singlePlayback/getDetails/secure?channel_id=0-9-9z583538&device_id=' . $guestToken . '&platform_name=desktop_web&translation=en&user_language=en,hi,te&country=IN&state=&app_version=4.24.0&user_type=guest&check_parental_control=false',
+        CURLOPT_URL => 'https://spapi.zee5.com/singlePlayback/getDetails/secure?channel_id=0-9-zeetv&device_id=' . $guestToken . '&platform_name=mobile_web&translation=en&user_language=en,hi,hr,mr&country=IN&state=RJ&app_version=6.5.12&user_type=guest&check_parental_control=false&uid=Z5X_e136a4b4-b083-494d-8c23-af9dd2294f50&ppid=e136a4b4-b083-494d-8c23-af9dd2294f50&version=15&os=android,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CUSTOMREQUEST  => 'POST',
         CURLOPT_HTTPHEADER     => [
