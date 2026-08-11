@@ -4,7 +4,7 @@ define('TOKEN_CACHE_FILE', __DIR__ . '/token_cache.json');
 define('TOKEN_REFRESH_INTERVAL', 600);          // 10 minutes for platform token
 define('M3U8_CACHE_DIR', __DIR__ . '/tmp/');
 define('M3U8_URL_CACHE_TTL', 100);              // 100 seconds for tokenised Akamai URL
-define('M3U8_CONTENT_CACHE_TTL', 100);          // 100 seconds for raw playlist content
+define('M3U8_CONTENT_CACHE_TTL', 100);          // 100 seconds for rewritten playlist
 
 // Ensure cache directory exists
 if (!file_exists(M3U8_CACHE_DIR)) {
@@ -175,24 +175,58 @@ function getCachedM3U8Url($channelId) {
         return $freshUrl;
     }
 
-    // Fallback to stale cache if fetch fails
+    // Fallback to stale cache
     if (file_exists($cacheFile)) {
-        $url = file_get_contents($cacheFile);
-        if (!empty($url)) return $url;
+        return file_get_contents($cacheFile);
     }
     return null;
 }
 
-/* ─── Get raw M3U8 playlist content (cached for 100 seconds) ─── */
-function getCachedM3U8Content($channelId) {
-    $contentCacheFile = M3U8_CACHE_DIR . 'm3u8_content_' . md5($channelId) . '.cache';
+/* ─── Rewrite relative variant URIs to absolute Akamai URLs ─── */
+function rewritePlaylist($content, $masterUrl) {
+    $parsed = parse_url($masterUrl);
+    $baseScheme = $parsed['scheme'];
+    $baseHost   = $parsed['host'];
+    // Base path: everything up to the last '/'
+    $basePath = preg_replace('#/[^/]*$#', '/', $parsed['path']);
+
+    $lines = explode("\n", $content);
+    $newLines = [];
+
+    foreach ($lines as $line) {
+        $line = rtrim($line);
+        // Keep comments and empty lines unchanged
+        if ($line === '' || $line[0] === '#') {
+            $newLines[] = $line;
+            continue;
+        }
+
+        // If it's already an absolute URL, leave it as-is
+        if (filter_var($line, FILTER_VALIDATE_URL)) {
+            $newLines[] = $line;
+            continue;
+        }
+
+        // It's a relative URI → build absolute URL
+        // Remove any leading ./ 
+        $relativePath = ltrim($line, '.');
+        // Combine with base path
+        $absoluteUrl = $baseScheme . '://' . $baseHost . $basePath . ltrim($relativePath, '/');
+        $newLines[] = $absoluteUrl;
+    }
+
+    return implode("\n", $newLines);
+}
+
+/* ─── Get rewritten M3U8 playlist content (cached for 100 seconds) ─── */
+function getCachedRewrittenPlaylist($channelId) {
+    $contentCacheFile = M3U8_CACHE_DIR . 'm3u8_rewritten_' . md5($channelId) . '.cache';
 
     // Return cached content if fresh
     if (file_exists($contentCacheFile)) {
         $cacheTime = filemtime($contentCacheFile);
         if ((time() - $cacheTime) < M3U8_CONTENT_CACHE_TTL) {
-            $content = file_get_contents($contentCacheFile);
-            if ($content !== false) return $content;
+            return file_get_contents($contentCacheFile);
         }
     }
 
@@ -200,7 +234,7 @@ function getCachedM3U8Content($channelId) {
     $masterUrl = getCachedM3U8Url($channelId);
     if (!$masterUrl) return null;
 
-    // Fetch the master playlist from Akamai
+    // Fetch the raw master playlist from Akamai
     $ch = curl_init($masterUrl);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
@@ -208,23 +242,26 @@ function getCachedM3U8Content($channelId) {
         CURLOPT_TIMEOUT        => 10,
         CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     ]);
-    $content = curl_exec($ch);
+    $rawContent = curl_exec($ch);
     $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    if ($httpcode !== 200 || empty($content)) return null;
+    if ($httpcode !== 200 || empty($rawContent)) return null;
 
-    // Save to cache
+    // Rewrite relative URIs to absolute Akamai URLs
+    $rewritten = rewritePlaylist($rawContent, $masterUrl);
+
+    // Save rewritten playlist to cache
     $fp = fopen($contentCacheFile, 'c+');
     if ($fp && flock($fp, LOCK_EX)) {
         ftruncate($fp, 0);
-        fwrite($fp, $content);
+        fwrite($fp, $rewritten);
         fflush($fp);
         flock($fp, LOCK_UN);
         fclose($fp);
     }
 
-    return $content;
+    return $rewritten;
 }
 
 /* ─── Determine channel ID from URL path or query ─── */
@@ -262,10 +299,10 @@ if (!$channelId) {
     exit;
 }
 
-// If request is a .m3u8 path → serve raw Akamai master playlist directly (with CORS, no proxy)
+// If request is a .m3u8 path → serve rewritten master playlist (CORS enabled, absolute Akamai variant URLs)
 if (preg_match('#\.m3u8$#', $_SERVER['REQUEST_URI'] ?? '')) {
-    $content = getCachedM3U8Content($channelId);
-    if (!$content) {
+    $rewrittenContent = getCachedRewrittenPlaylist($channelId);
+    if (!$rewrittenContent) {
         http_response_code(502);
         setCorsHeaders();
         echo 'Failed to fetch M3U8 playlist.';
@@ -274,7 +311,7 @@ if (preg_match('#\.m3u8$#', $_SERVER['REQUEST_URI'] ?? '')) {
 
     setCorsHeaders();
     header('Content-Type: application/vnd.apple.mpegurl');
-    echo $content;
+    echo $rewrittenContent;
     exit;
 }
 
