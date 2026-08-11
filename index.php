@@ -1,10 +1,9 @@
 <?php
 /* ─── Configuration ─── */
 define('TOKEN_CACHE_FILE', __DIR__ . '/token_cache.json');
-define('TOKEN_REFRESH_INTERVAL', 600);          // 10 minutes
+define('TOKEN_REFRESH_INTERVAL', 600);      // 10 minutes
 define('M3U8_CACHE_DIR', __DIR__ . '/tmp/');
-define('PLAYABLE_URL_CACHE_TTL', 100);          // 100 seconds for the tokenised master URL
-define('PLAYLIST_CACHE_TTL', 5);                // 5 seconds short burst cache for playlist + cookies
+define('PLAYABLE_URL_CACHE_TTL', 100);      // 100 seconds
 
 // Ensure cache directory exists
 if (!file_exists(M3U8_CACHE_DIR)) {
@@ -168,101 +167,22 @@ function getCachedPlayableUrl($channelId) {
         }
         return $freshUrl;
     }
-    // fallback to stale
     if (file_exists($cacheFile)) return file_get_contents($cacheFile);
     return null;
 }
 
-/* ─── Fetch master playlist + Akamai Set-Cookie headers ─── */
-function fetchMasterPlaylistWithCookies($channelId) {
-    $playableUrl = getCachedPlayableUrl($channelId);
-    if (!$playableUrl) return null;
+/* ─── Build a minimal master playlist that points directly to Akamai ─── */
+function buildRedirectPlaylist($channelId) {
+    $akamaiUrl = getCachedPlayableUrl($channelId);
+    if (!$akamaiUrl) return null;
 
-    $ch = curl_init($playableUrl);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_TIMEOUT        => 10,
-        CURLOPT_HEADER         => true,           // we need the response headers
-        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    ]);
-    $response = curl_exec($ch);
-    $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    curl_close($ch);
+    // Create a simple M3U8 that contains just one stream pointing to the real master
+    $playlist = "#EXTM3U\n";
+    $playlist .= "#EXT-X-VERSION:3\n";
+    $playlist .= "#EXT-X-STREAM-INF:BANDWIDTH=5000000\n";   // dummy bandwidth
+    $playlist .= $akamaiUrl . "\n";
 
-    if ($httpcode !== 200 || empty($response)) return null;
-
-    // Separate headers and body
-    $headers = substr($response, 0, $headerSize);
-    $body = substr($response, $headerSize);
-
-    // Extract Set-Cookie headers
-    $cookies = [];
-    if (preg_match_all('/^Set-Cookie:\s*([^\r\n]*)/im', $headers, $matches)) {
-        $cookies = $matches[1];
-    }
-
-    // Rewrite relative URIs to absolute
-    $rewritten = rewritePlaylist($body, $playableUrl);
-
-    return [
-        'content' => $rewritten,
-        'cookies' => $cookies
-    ];
-}
-
-/* ─── Rewrite a master playlist: convert all relative URIs to absolute Akamai URLs ─── */
-function rewritePlaylist($content, $baseUrl) {
-    $parsed = parse_url($baseUrl);
-    $scheme = $parsed['scheme'];
-    $host   = $parsed['host'];
-    $basePath = preg_replace('#/[^/]*$#', '/', $parsed['path']);
-
-    $lines = explode("\n", $content);
-    $newLines = [];
-
-    foreach ($lines as $line) {
-        $line = rtrim($line);
-        if ($line === '' || $line[0] === '#') {
-            $newLines[] = $line;
-            continue;
-        }
-        if (filter_var($line, FILTER_VALIDATE_URL)) {
-            $newLines[] = $line;
-            continue;
-        }
-        $relativePath = ltrim($line, '.');
-        $absoluteUrl = $scheme . '://' . $host . $basePath . ltrim($relativePath, '/');
-        $newLines[] = $absoluteUrl;
-    }
-
-    return implode("\n", $newLines);
-}
-
-/* ─── Short cache for playlist + cookies ─── */
-function getCachedPlaylistWithCookies($channelId) {
-    $cacheFile = M3U8_CACHE_DIR . 'pl_cookies_' . md5($channelId) . '.cache';
-
-    if (file_exists($cacheFile)) {
-        $cacheTime = filemtime($cacheFile);
-        if ((time() - $cacheTime) < PLAYLIST_CACHE_TTL) {
-            return json_decode(file_get_contents($cacheFile), true);
-        }
-    }
-
-    $data = fetchMasterPlaylistWithCookies($channelId);
-    if ($data) {
-        $fp = fopen($cacheFile, 'c+');
-        if ($fp && flock($fp, LOCK_EX)) {
-            ftruncate($fp, 0);
-            fwrite($fp, json_encode($data));
-            fflush($fp);
-            flock($fp, LOCK_UN);
-            fclose($fp);
-        }
-    }
-    return $data;
+    return $playlist;
 }
 
 /* ─── Extract channel ID ─── */
@@ -279,7 +199,6 @@ function setCorsHeaders() {
     header('Access-Control-Allow-Origin: *');
     header('Access-Control-Allow-Methods: GET, OPTIONS');
     header('Access-Control-Allow-Headers: *');
-    header('Access-Control-Max-Age: 86400');
 }
 
 /* ─── Main ─── */
@@ -300,24 +219,18 @@ if (!$channelId) {
     exit;
 }
 
-// .m3u8 request → serve master playlist with Akamai cookies forwarded
+// .m3u8 request → serve the redirect master playlist
 if (preg_match('#\.m3u8$#', $_SERVER['REQUEST_URI'] ?? '')) {
-    $data = getCachedPlaylistWithCookies($channelId);
-    if (!$data) {
+    $playlist = buildRedirectPlaylist($channelId);
+    if (!$playlist) {
         http_response_code(502);
         setCorsHeaders();
-        echo 'Failed to fetch playlist.';
+        echo 'Failed to generate playlist.';
         exit;
     }
-
-    // Forward all Akamai Set-Cookie headers
-    foreach ($data['cookies'] as $cookie) {
-        header('Set-Cookie: ' . $cookie, false);
-    }
-
     setCorsHeaders();
     header('Content-Type: application/vnd.apple.mpegurl');
-    echo $data['content'];
+    echo $playlist;
     exit;
 }
 
