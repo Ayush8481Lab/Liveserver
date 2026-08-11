@@ -88,7 +88,7 @@ function fetchTokenFromApi() {
     return null;
 }
 
-/* ─── Fetch playable Akamai master URL ─── */
+/* ─── Fetch playable Akamai URL ─── */
 function fetchFreshPlayableUrl($channelId) {
     $deviceId   = generateUUID();
     $guestToken = $deviceId;
@@ -137,7 +137,7 @@ function fetchFreshPlayableUrl($channelId) {
     return $data['keyOsDetails']['video_token'] ?? null;
 }
 
-/* ─── Cache the playable URL ─── */
+/* ─── Cache playable URL ─── */
 function getCachedPlayableUrl($channelId) {
     $cacheFile = M3U8_CACHE_DIR . 'playable_' . md5($channelId) . '.cache';
     if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < PLAYABLE_URL_CACHE_TTL) {
@@ -160,34 +160,63 @@ function getChannelIdFromRequest() {
     return $_GET['id'] ?? null;
 }
 
+/* ─── CORS helper ─── */
+function setCorsHeaders() {
+    header('Access-Control-Allow-Origin: *');
+    header('Access-Control-Allow-Methods: GET, OPTIONS');
+    header('Access-Control-Allow-Headers: *');
+}
+
 /* ─── Main ─── */
+
+// Handle CORS preflight
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    setCorsHeaders();
+    http_response_code(204);
+    exit;
+}
+
 $channelId = getChannelIdFromRequest();
 if (!$channelId) {
     http_response_code(400);
+    setCorsHeaders();
     header('Content-Type: application/json');
     echo json_encode(["error" => "Channel ID required. Use /{id}.m3u8 or ?id=CHANNEL_ID"]);
     exit;
 }
 
-$playableUrl = getCachedPlayableUrl($channelId);
-if (!$playableUrl) {
-    http_response_code(502);
-    header('Content-Type: application/json');
-    echo json_encode(["error" => "Could not fetch playable URL"]);
-    exit;
-}
-
-// If request ends with .m3u8 → redirect to Akamai, but tell the player NOT to send a Referer
+// If request ends with .m3u8 → redirect to Akamai (or serve minimal playlist)
+// (keeping the redirect as simplest working version)
 if (preg_match('#\.m3u8$#', $_SERVER['REQUEST_URI'] ?? '')) {
-    header('Access-Control-Allow-Origin: *');
-    header('Access-Control-Allow-Methods: GET, OPTIONS');
-    header('Referrer-Policy: no-referrer');   // ← the magic header
-    header('Cache-Control: no-store');        // prevent caching of the redirect
+    $playableUrl = getCachedPlayableUrl($channelId);
+    if (!$playableUrl) {
+        http_response_code(502);
+        setCorsHeaders();
+        echo 'Failed to obtain stream URL';
+        exit;
+    }
+
+    setCorsHeaders();
+    header('Referrer-Policy: no-referrer');   // helps with some geo‑checks
+    header('Cache-Control: no-store');
     header('Location: ' . $playableUrl, true, 302);
     exit;
 }
 
-// ?id= debug
+// Otherwise, ?id= → JSON debug output (CORS enabled)
+$playableUrl = getCachedPlayableUrl($channelId);
+if (!$playableUrl) {
+    http_response_code(502);
+    setCorsHeaders();
+    header('Content-Type: application/json');
+    echo json_encode(["error" => "Could not fetch playable URL."]);
+    exit;
+}
+
+setCorsHeaders();
 header('Content-Type: application/json');
-echo json_encode(['status' => 'success', 'playable' => $playableUrl]);
+echo json_encode([
+    'status'           => 'success',
+    'playable_redirect'=> $playableUrl
+]);
 exit;
