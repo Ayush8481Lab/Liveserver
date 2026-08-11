@@ -2,12 +2,8 @@
 /* ─── Configuration ─── */
 define('TOKEN_CACHE_FILE', __DIR__ . '/token_cache.json');
 define('TOKEN_REFRESH_INTERVAL', 600);          // 10 minutes
-define('M3U8_CACHE_DIR', __DIR__ . '/tmp/');
-define('PLAYABLE_URL_CACHE_TTL', 100);          // 100 seconds
-
-if (!file_exists(M3U8_CACHE_DIR)) {
-    mkdir(M3U8_CACHE_DIR, 0755, true);
-}
+define('PLAYABLE_URL_CACHE_TTL', 120);          // 2 minutes – balances freshness & speed
+define('LOCK_FILE', __DIR__ . '/token_refresh.lock');
 
 /* ─── Helpers ─── */
 function generateUUID() {
@@ -43,23 +39,52 @@ function generateDDToken() {
     ]));
 }
 
-/* ─── Platform token ─── */
+/* ─── Token management (non‑blocking) ─── */
+
+/**
+ * Returns the cached token instantly.
+ * If the token is missing, fetches it synchronously (only once).
+ */
 function getPlatformToken() {
-    if (file_exists(TOKEN_CACHE_FILE)) {
-        $cacheTime = filemtime(TOKEN_CACHE_FILE);
-        if ((time() - $cacheTime) < TOKEN_REFRESH_INTERVAL) {
-            $data = json_decode(file_get_contents(TOKEN_CACHE_FILE), true);
-            if (!empty($data['token'])) return $data['token'];
+    $cache = loadTokenCache();
+    if ($cache && !empty($cache['token'])) {
+        // If token is stale, trigger a background refresh (but still return old token)
+        if ((time() - $cache['fetched_at']) >= TOKEN_REFRESH_INTERVAL) {
+            triggerBackgroundTokenRefresh();
         }
+        return $cache['token'];
     }
+
+    // No token at all – fetch synchronously (first run)
     $token = fetchTokenFromApi();
-    if (!$token && file_exists(TOKEN_CACHE_FILE)) {
-        $data = json_decode(file_get_contents(TOKEN_CACHE_FILE), true);
-        if (!empty($data['token'])) return $data['token'];
+    if ($token) {
+        saveTokenCache($token);
+        return $token;
     }
-    return $token;
+    return null;
 }
 
+/**
+ * Loads token cache from file.
+ */
+function loadTokenCache() {
+    if (!file_exists(TOKEN_CACHE_FILE)) return null;
+    $data = file_get_contents(TOKEN_CACHE_FILE);
+    return json_decode($data, true);
+}
+
+/**
+ * Saves token to cache file.
+ */
+function saveTokenCache($token) {
+    $data = ['token' => $token, 'fetched_at' => time()];
+    file_put_contents(TOKEN_CACHE_FILE, json_encode($data), LOCK_EX);
+}
+
+/**
+ * Fetches a new token from the API (blocking call).
+ * Used only during background refresh or first‑time sync.
+ */
 function fetchTokenFromApi() {
     $ch = curl_init('https://jiotvegp.vercel.app/api/token');
     curl_setopt_array($ch, [
@@ -74,25 +99,66 @@ function fetchTokenFromApi() {
     if ($httpCode !== 200 || empty($response)) return null;
     $data = json_decode($response, true);
     if ($data['success'] && !empty($data['token'])) {
-        $token = $data['token'];
-        $fp = fopen(TOKEN_CACHE_FILE, 'c+');
-        if ($fp && flock($fp, LOCK_EX)) {
-            ftruncate($fp, 0);
-            fwrite($fp, json_encode(['token' => $token, 'fetched_at' => time()]));
-            fflush($fp);
-            flock($fp, LOCK_UN);
-            fclose($fp);
-        }
-        return $token;
+        return $data['token'];
     }
     return null;
 }
 
-/* ─── Fetch playable Akamai URL ─── */
+/**
+ * Triggers a background token refresh if not already running.
+ * Uses a lock file to prevent multiple concurrent refreshes.
+ */
+function triggerBackgroundTokenRefresh() {
+    // Already refreshing? Skip.
+    if (file_exists(LOCK_FILE)) {
+        $lockAge = time() - filemtime(LOCK_FILE);
+        if ($lockAge < 60) return; // assume refresh is still ongoing
+        // If lock is older than 60s, it's stale – remove it and proceed
+        @unlink(LOCK_FILE);
+    }
+
+    // Create lock file
+    file_put_contents(LOCK_FILE, time(), LOCK_EX);
+
+    // Spawn background process (async)
+    $cmd = 'php -r "require_once \'' . __FILE__ . '\'; doBackgroundTokenRefresh();" > /dev/null 2>&1 &';
+    if (function_exists('fastcgi_finish_request')) {
+        // Finish the current request first, then execute in the same process? No, we need to fork.
+        // We'll use exec to run a separate process.
+        exec($cmd);
+    } else {
+        // Fallback: use exec anyway.
+        exec($cmd);
+    }
+    // The lock will be removed by the background process when done.
+}
+
+/**
+ * Background task – called by the spawned process.
+ * This function is not exposed to the web; it's invoked via CLI.
+ */
+function doBackgroundTokenRefresh() {
+    // Prevent timeout
+    set_time_limit(30);
+    $lockFile = LOCK_FILE;
+
+    // Double‑check lock (should exist)
+    if (!file_exists($lockFile)) return;
+
+    $newToken = fetchTokenFromApi();
+    if ($newToken) {
+        saveTokenCache($newToken);
+    }
+    // Remove lock regardless of success
+    @unlink($lockFile);
+}
+
+/* ─── Playable URL with caching ─── */
+
 function fetchFreshPlayableUrl($channelId) {
     $deviceId   = generateUUID();
     $guestToken = $deviceId;
-    $platformToken = getPlatformToken();
+    $platformToken = getPlatformToken(); // non‑blocking
     if (!$platformToken) return null;
 
     $queryParams = http_build_query([
@@ -137,9 +203,11 @@ function fetchFreshPlayableUrl($channelId) {
     return $data['keyOsDetails']['video_token'] ?? null;
 }
 
-/* ─── Cache playable URL ─── */
 function getCachedPlayableUrl($channelId) {
-    $cacheFile = M3U8_CACHE_DIR . 'playable_' . md5($channelId) . '.cache';
+    $cacheFile = __DIR__ . '/tmp/playable_' . md5($channelId) . '.cache';
+    // Create tmp dir if missing
+    if (!is_dir(__DIR__ . '/tmp')) mkdir(__DIR__ . '/tmp', 0755, true);
+
     if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < PLAYABLE_URL_CACHE_TTL) {
         return file_get_contents($cacheFile);
     }
@@ -148,10 +216,12 @@ function getCachedPlayableUrl($channelId) {
         file_put_contents($cacheFile, $freshUrl, LOCK_EX);
         return $freshUrl;
     }
+    // If fetch fails, return stale cache if exists
     return file_exists($cacheFile) ? file_get_contents($cacheFile) : null;
 }
 
-/* ─── Extract channel ID ─── */
+/* ─── Request helpers ─── */
+
 function getChannelIdFromRequest() {
     $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
     if (preg_match('#/([a-zA-Z0-9\-_]+)\.m3u8$#', $path, $m)) {
@@ -160,7 +230,6 @@ function getChannelIdFromRequest() {
     return $_GET['id'] ?? null;
 }
 
-/* ─── CORS helper ─── */
 function setCorsHeaders() {
     header('Access-Control-Allow-Origin: *');
     header('Access-Control-Allow-Methods: GET, OPTIONS');
@@ -169,7 +238,7 @@ function setCorsHeaders() {
 
 /* ─── Main ─── */
 
-// Handle CORS preflight
+// CORS preflight
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     setCorsHeaders();
     http_response_code(204);
@@ -185,8 +254,7 @@ if (!$channelId) {
     exit;
 }
 
-// If request ends with .m3u8 → redirect to Akamai (or serve minimal playlist)
-// (keeping the redirect as simplest working version)
+// If request ends with .m3u8 → redirect to Akamai (fast)
 if (preg_match('#\.m3u8$#', $_SERVER['REQUEST_URI'] ?? '')) {
     $playableUrl = getCachedPlayableUrl($channelId);
     if (!$playableUrl) {
@@ -195,15 +263,14 @@ if (preg_match('#\.m3u8$#', $_SERVER['REQUEST_URI'] ?? '')) {
         echo 'Failed to obtain stream URL';
         exit;
     }
-
     setCorsHeaders();
-    header('Referrer-Policy: no-referrer');   // helps with some geo‑checks
+    header('Referrer-Policy: no-referrer');
     header('Cache-Control: no-store');
     header('Location: ' . $playableUrl, true, 302);
     exit;
 }
 
-// Otherwise, ?id= → JSON debug output (CORS enabled)
+// ?id= → JSON debug (CORS enabled)
 $playableUrl = getCachedPlayableUrl($channelId);
 if (!$playableUrl) {
     http_response_code(502);
