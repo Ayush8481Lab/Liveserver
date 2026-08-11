@@ -3,8 +3,8 @@
 define('TOKEN_CACHE_FILE', __DIR__ . '/token_cache.json');
 define('TOKEN_REFRESH_INTERVAL', 600);          // 10 minutes
 define('M3U8_CACHE_DIR', __DIR__ . '/tmp/');
-define('M3U8_URL_CACHE_TTL', 100);              // 100 seconds for tokenised Akamai URL
-define('M3U8_CONTENT_CACHE_TTL', 100);          // 100 seconds for rewritten playlist
+define('PLAYABLE_URL_CACHE_TTL', 100);          // 100 seconds for the tokenised master URL
+define('PLAYLIST_CACHE_TTL', 5);                // 5 seconds short burst cache for playlist + cookies
 
 // Ensure cache directory exists
 if (!file_exists(M3U8_CACHE_DIR)) {
@@ -151,9 +151,8 @@ function getCachedPlayableUrl($channelId) {
 
     if (file_exists($cacheFile)) {
         $cacheTime = filemtime($cacheFile);
-        if ((time() - $cacheTime) < M3U8_URL_CACHE_TTL) {
-            $url = file_get_contents($cacheFile);
-            if (!empty($url)) return $url;
+        if ((time() - $cacheTime) < PLAYABLE_URL_CACHE_TTL) {
+            return file_get_contents($cacheFile);
         }
     }
 
@@ -169,10 +168,48 @@ function getCachedPlayableUrl($channelId) {
         }
         return $freshUrl;
     }
-    if (file_exists($cacheFile)) {
-        return file_get_contents($cacheFile);
-    }
+    // fallback to stale
+    if (file_exists($cacheFile)) return file_get_contents($cacheFile);
     return null;
+}
+
+/* ─── Fetch master playlist + Akamai Set-Cookie headers ─── */
+function fetchMasterPlaylistWithCookies($channelId) {
+    $playableUrl = getCachedPlayableUrl($channelId);
+    if (!$playableUrl) return null;
+
+    $ch = curl_init($playableUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT        => 10,
+        CURLOPT_HEADER         => true,           // we need the response headers
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    ]);
+    $response = curl_exec($ch);
+    $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+
+    if ($httpcode !== 200 || empty($response)) return null;
+
+    // Separate headers and body
+    $headers = substr($response, 0, $headerSize);
+    $body = substr($response, $headerSize);
+
+    // Extract Set-Cookie headers
+    $cookies = [];
+    if (preg_match_all('/^Set-Cookie:\s*([^\r\n]*)/im', $headers, $matches)) {
+        $cookies = $matches[1];
+    }
+
+    // Rewrite relative URIs to absolute
+    $rewritten = rewritePlaylist($body, $playableUrl);
+
+    return [
+        'content' => $rewritten,
+        'cookies' => $cookies
+    ];
 }
 
 /* ─── Rewrite a master playlist: convert all relative URIs to absolute Akamai URLs ─── */
@@ -187,17 +224,14 @@ function rewritePlaylist($content, $baseUrl) {
 
     foreach ($lines as $line) {
         $line = rtrim($line);
-        // Keep blank lines and comment lines unchanged
         if ($line === '' || $line[0] === '#') {
             $newLines[] = $line;
             continue;
         }
-        // Already absolute URL? leave it
         if (filter_var($line, FILTER_VALIDATE_URL)) {
             $newLines[] = $line;
             continue;
         }
-        // Relative URI → build absolute
         $relativePath = ltrim($line, '.');
         $absoluteUrl = $scheme . '://' . $host . $basePath . ltrim($relativePath, '/');
         $newLines[] = $absoluteUrl;
@@ -206,50 +240,29 @@ function rewritePlaylist($content, $baseUrl) {
     return implode("\n", $newLines);
 }
 
-/* ─── Get the final, rewritten playlist (cached) ─── */
-function getCachedRewrittenPlaylist($channelId) {
-    $cacheFile = M3U8_CACHE_DIR . 'rewritten_' . md5($channelId) . '.cache';
+/* ─── Short cache for playlist + cookies ─── */
+function getCachedPlaylistWithCookies($channelId) {
+    $cacheFile = M3U8_CACHE_DIR . 'pl_cookies_' . md5($channelId) . '.cache';
 
-    // Return cached version if still fresh
     if (file_exists($cacheFile)) {
         $cacheTime = filemtime($cacheFile);
-        if ((time() - $cacheTime) < M3U8_CONTENT_CACHE_TTL) {
-            return file_get_contents($cacheFile);
+        if ((time() - $cacheTime) < PLAYLIST_CACHE_TTL) {
+            return json_decode(file_get_contents($cacheFile), true);
         }
     }
 
-    // Get the playable Akamai master URL
-    $playableUrl = getCachedPlayableUrl($channelId);
-    if (!$playableUrl) return null;
-
-    // Fetch the raw master playlist from Akamai
-    $ch = curl_init($playableUrl);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_TIMEOUT        => 10,
-        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    ]);
-    $raw = curl_exec($ch);
-    $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($httpcode !== 200 || empty($raw)) return null;
-
-    // Rewrite it so that all variant streams point directly to Akamai
-    $rewritten = rewritePlaylist($raw, $playableUrl);
-
-    // Save to cache
-    $fp = fopen($cacheFile, 'c+');
-    if ($fp && flock($fp, LOCK_EX)) {
-        ftruncate($fp, 0);
-        fwrite($fp, $rewritten);
-        fflush($fp);
-        flock($fp, LOCK_UN);
-        fclose($fp);
+    $data = fetchMasterPlaylistWithCookies($channelId);
+    if ($data) {
+        $fp = fopen($cacheFile, 'c+');
+        if ($fp && flock($fp, LOCK_EX)) {
+            ftruncate($fp, 0);
+            fwrite($fp, json_encode($data));
+            fflush($fp);
+            flock($fp, LOCK_UN);
+            fclose($fp);
+        }
     }
-
-    return $rewritten;
+    return $data;
 }
 
 /* ─── Extract channel ID ─── */
@@ -287,18 +300,24 @@ if (!$channelId) {
     exit;
 }
 
-// .m3u8 request → serve rewritten playlist (no redirect, no proxy of video)
+// .m3u8 request → serve master playlist with Akamai cookies forwarded
 if (preg_match('#\.m3u8$#', $_SERVER['REQUEST_URI'] ?? '')) {
-    $playlist = getCachedRewrittenPlaylist($channelId);
-    if (!$playlist) {
+    $data = getCachedPlaylistWithCookies($channelId);
+    if (!$data) {
         http_response_code(502);
         setCorsHeaders();
         echo 'Failed to fetch playlist.';
         exit;
     }
+
+    // Forward all Akamai Set-Cookie headers
+    foreach ($data['cookies'] as $cookie) {
+        header('Set-Cookie: ' . $cookie, false);
+    }
+
     setCorsHeaders();
     header('Content-Type: application/vnd.apple.mpegurl');
-    echo $playlist;
+    echo $data['content'];
     exit;
 }
 
