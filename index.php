@@ -1,15 +1,15 @@
 <?php
 /* ─── Configuration ─── */
 define('TOKEN_CACHE_FILE', __DIR__ . '/token_cache.json');
-define('TOKEN_REFRESH_INTERVAL', 600);      // 10 minutes
+define('TOKEN_REFRESH_INTERVAL', 600);          // 10 minutes
 define('M3U8_CACHE_DIR', __DIR__ . '/tmp/');
-define('PLAYABLE_URL_CACHE_TTL', 100);      // 100 seconds
+define('PLAYABLE_URL_CACHE_TTL', 100);          // 100 seconds
 
 if (!file_exists(M3U8_CACHE_DIR)) {
     mkdir(M3U8_CACHE_DIR, 0755, true);
 }
 
-/* ─── Helpers (UUID, DD token, platform token, etc.) unchanged ─── */
+/* ─── Helpers ─── */
 function generateUUID() {
     $data = random_bytes(16);
     $data[6] = chr(ord($data[6]) & 0x0f | 0x40);
@@ -43,6 +43,7 @@ function generateDDToken() {
     ]));
 }
 
+/* ─── Platform token (unchanged) ─── */
 function getPlatformToken() {
     if (file_exists(TOKEN_CACHE_FILE)) {
         $cacheTime = filemtime(TOKEN_CACHE_FILE);
@@ -87,6 +88,7 @@ function fetchTokenFromApi() {
     return null;
 }
 
+/* ─── Fetch the playable Akamai master URL (video_token) ─── */
 function fetchFreshPlayableUrl($channelId) {
     $deviceId   = generateUUID();
     $guestToken = $deviceId;
@@ -135,6 +137,7 @@ function fetchFreshPlayableUrl($channelId) {
     return $data['keyOsDetails']['video_token'] ?? null;
 }
 
+/* ─── Cache the playable URL ─── */
 function getCachedPlayableUrl($channelId) {
     $cacheFile = M3U8_CACHE_DIR . 'playable_' . md5($channelId) . '.cache';
     if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < PLAYABLE_URL_CACHE_TTL) {
@@ -148,37 +151,78 @@ function getCachedPlayableUrl($channelId) {
     return file_exists($cacheFile) ? file_get_contents($cacheFile) : null;
 }
 
+/* ─── Build a minimal master playlist that points directly to Akamai ─── */
+function buildRedirectPlaylist($channelId) {
+    $akamaiUrl = getCachedPlayableUrl($channelId);
+    if (!$akamaiUrl) return null;
+
+    // Simple M3U8 with a single stream entry pointing to the real Akamai master
+    return "#EXTM3U\n"
+         . "#EXT-X-VERSION:3\n"
+         . "#EXT-X-STREAM-INF:BANDWIDTH=5000000\n"
+         . $akamaiUrl . "\n";
+}
+
+/* ─── Extract channel ID ─── */
 function getChannelIdFromRequest() {
     $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-    if (preg_match('#/([a-zA-Z0-9\-_]+)\.m3u8$#', $path, $m)) return $m[1];
+    if (preg_match('#/([a-zA-Z0-9\-_]+)\.m3u8$#', $path, $m)) {
+        return $m[1];
+    }
     return $_GET['id'] ?? null;
 }
 
+/* ─── CORS ─── */
+function setCorsHeaders() {
+    header('Access-Control-Allow-Origin: *');
+    header('Access-Control-Allow-Methods: GET, OPTIONS');
+    header('Access-Control-Allow-Headers: *');
+}
+
 /* ─── Main ─── */
+
+// Preflight
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    setCorsHeaders();
+    http_response_code(204);
+    exit;
+}
+
 $channelId = getChannelIdFromRequest();
 if (!$channelId) {
     http_response_code(400);
     header('Content-Type: application/json');
+    setCorsHeaders();
     echo json_encode(["error" => "Channel ID required. Use /{id}.m3u8 or ?id=CHANNEL_ID"]);
     exit;
 }
 
+// .m3u8 request → serve minimal master playlist (no redirect)
+if (preg_match('#\.m3u8$#', $_SERVER['REQUEST_URI'] ?? '')) {
+    $playlist = buildRedirectPlaylist($channelId);
+    if (!$playlist) {
+        http_response_code(502);
+        setCorsHeaders();
+        echo 'Failed to generate playlist.';
+        exit;
+    }
+    setCorsHeaders();
+    header('Content-Type: application/vnd.apple.mpegurl');
+    // Prevent caching of this tiny playlist (the Akamai URL itself can be cached up to 100s)
+    header('Cache-Control: public, max-age=10');  // short cache, safe
+    echo $playlist;
+    exit;
+}
+
+// ?id= debug
 $playableUrl = getCachedPlayableUrl($channelId);
 if (!$playableUrl) {
     http_response_code(502);
     header('Content-Type: application/json');
-    echo json_encode(["error" => "Could not fetch playable URL"]);
+    echo json_encode(["error" => "Could not fetch playable URL."]);
     exit;
 }
-
-// If request ends with .m3u8 → redirect to Akamai
-if (preg_match('#\.m3u8$#', $_SERVER['REQUEST_URI'] ?? '')) {
-    header('Access-Control-Allow-Origin: *');
-    header('Location: ' . $playableUrl, true, 302);
-    exit;
-}
-
-// Otherwise JSON debug
+setCorsHeaders();
 header('Content-Type: application/json');
 echo json_encode(['status' => 'success', 'playable' => $playableUrl]);
 exit;
