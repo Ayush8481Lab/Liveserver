@@ -1,17 +1,17 @@
 <?php
 /* ─── Configuration ─── */
 define('TOKEN_CACHE_FILE', __DIR__ . '/token_cache.json');
-define('TOKEN_REFRESH_INTERVAL', 600);      // 10 minutes
+define('TOKEN_REFRESH_INTERVAL', 600);          // 10 minutes for platform token
 define('M3U8_CACHE_DIR', __DIR__ . '/tmp/');
-define('M3U8_URL_CACHE_TTL', 100);          // 100 seconds for M3U8 URL
-define('M3U8_CONTENT_CACHE_TTL', 100);      // 100 seconds for playlist content
+define('M3U8_URL_CACHE_TTL', 100);              // 100 seconds for tokenised Akamai URL
+define('M3U8_CONTENT_CACHE_TTL', 100);          // 100 seconds for raw playlist content
 
 // Ensure cache directory exists
 if (!file_exists(M3U8_CACHE_DIR)) {
     mkdir(M3U8_CACHE_DIR, 0755, true);
 }
 
-/* ─── Helpers ─── */
+/* ─── Helper: generate a random UUID v4 ─── */
 function generateUUID() {
     $data = random_bytes(16);
     $data[6] = chr(ord($data[6]) & 0x0f | 0x40);
@@ -19,6 +19,7 @@ function generateUUID() {
     return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
 }
 
+/* ─── Generate dd token ─── */
 function generateDDToken() {
     return base64_encode(json_encode([
         'schema_version'       => '1',
@@ -45,15 +46,18 @@ function generateDDToken() {
     ]));
 }
 
-/* ─── Platform token (unchanged) ─── */
+/* ─── Platform token management (external API + file cache) ─── */
 function getPlatformToken() {
     if (file_exists(TOKEN_CACHE_FILE)) {
         $cacheTime = filemtime(TOKEN_CACHE_FILE);
         if ((time() - $cacheTime) < TOKEN_REFRESH_INTERVAL) {
             $data = json_decode(file_get_contents(TOKEN_CACHE_FILE), true);
-            if (isset($data['token']) && !empty($data['token'])) return $data['token'];
+            if (isset($data['token']) && !empty($data['token'])) {
+                return $data['token'];
+            }
         }
     }
+
     $token = fetchTokenFromApi();
     if (!$token && file_exists(TOKEN_CACHE_FILE)) {
         $data = json_decode(file_get_contents(TOKEN_CACHE_FILE), true);
@@ -73,6 +77,7 @@ function fetchTokenFromApi() {
     $response = curl_exec($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
+
     if ($httpCode !== 200 || empty($response)) return null;
     $data = json_decode($response, true);
     if (isset($data['success'], $data['token']) && $data['success'] === true) {
@@ -90,7 +95,7 @@ function fetchTokenFromApi() {
     return null;
 }
 
-/* ─── Fetch fresh M3U8 URL ─── */
+/* ─── Fetch fresh M3U8 URL from Zee5 API (tokenised Akamai master) ─── */
 function fetchFreshM3U8url($channelId) {
     $deviceId   = generateUUID();
     $guestToken = $deviceId;
@@ -145,7 +150,7 @@ function fetchFreshM3U8url($channelId) {
     return null;
 }
 
-/* ─── Cached M3U8 URL ─── */
+/* ─── Get tokenised M3U8 URL with file cache ─── */
 function getCachedM3U8Url($channelId) {
     $cacheFile = M3U8_CACHE_DIR . 'm3u8_url_' . md5($channelId) . '.cache';
 
@@ -170,6 +175,7 @@ function getCachedM3U8Url($channelId) {
         return $freshUrl;
     }
 
+    // Fallback to stale cache if fetch fails
     if (file_exists($cacheFile)) {
         $url = file_get_contents($cacheFile);
         if (!empty($url)) return $url;
@@ -177,11 +183,11 @@ function getCachedM3U8Url($channelId) {
     return null;
 }
 
-/* ─── Cached M3U8 content (the playlist text) ─── */
+/* ─── Get raw M3U8 playlist content (cached for 100 seconds) ─── */
 function getCachedM3U8Content($channelId) {
     $contentCacheFile = M3U8_CACHE_DIR . 'm3u8_content_' . md5($channelId) . '.cache';
 
-    // Check if fresh cached content exists
+    // Return cached content if fresh
     if (file_exists($contentCacheFile)) {
         $cacheTime = filemtime($contentCacheFile);
         if ((time() - $cacheTime) < M3U8_CONTENT_CACHE_TTL) {
@@ -190,11 +196,11 @@ function getCachedM3U8Content($channelId) {
         }
     }
 
-    // Get the tokenised M3U8 URL (cached separately)
+    // Get tokenised master URL
     $masterUrl = getCachedM3U8Url($channelId);
     if (!$masterUrl) return null;
 
-    // Fetch the playlist from Akamai
+    // Fetch the master playlist from Akamai
     $ch = curl_init($masterUrl);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
@@ -208,7 +214,7 @@ function getCachedM3U8Content($channelId) {
 
     if ($httpcode !== 200 || empty($content)) return null;
 
-    // Cache the content
+    // Save to cache
     $fp = fopen($contentCacheFile, 'c+');
     if ($fp && flock($fp, LOCK_EX)) {
         ftruncate($fp, 0);
@@ -221,7 +227,7 @@ function getCachedM3U8Content($channelId) {
     return $content;
 }
 
-/* ─── Determine channel ID ─── */
+/* ─── Determine channel ID from URL path or query ─── */
 function getChannelIdFromRequest() {
     $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
     if (preg_match('#/([a-zA-Z0-9\-_]+)\.m3u8$#', $path, $m)) {
@@ -256,7 +262,7 @@ if (!$channelId) {
     exit;
 }
 
-// If the request is a .m3u8 path → serve playlist directly with CORS
+// If request is a .m3u8 path → serve raw Akamai master playlist directly (with CORS, no proxy)
 if (preg_match('#\.m3u8$#', $_SERVER['REQUEST_URI'] ?? '')) {
     $content = getCachedM3U8Content($channelId);
     if (!$content) {
