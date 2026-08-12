@@ -1,9 +1,17 @@
 <?php
 /* ─── Configuration ─── */
 define('TOKEN_CACHE_FILE', __DIR__ . '/token_cache.json');
-define('TOKEN_REFRESH_INTERVAL', 600);          // 10 minute
-define('PLAYABLE_URL_CACHE_TTL', 120);          // 2 minutes – balances freshness & speed
+define('TOKEN_REFRESH_INTERVAL', 10800);         // 3 hours – token is valid for at least 3 hours
+define('PLAYABLE_URL_CACHE_TTL', 1500);          // 25 minutes – stream URL is valid 40‑60 minutes
 define('LOCK_FILE', __DIR__ . '/token_refresh.lock');
+
+/* ─── Background token refresh guard ───
+   When called from CLI with the BACKGROUND_TOKEN_REFRESH constant,
+   run only the refresh and exit – do NOT process a normal web request. */
+if (defined('BACKGROUND_TOKEN_REFRESH') && BACKGROUND_TOKEN_REFRESH === true) {
+    doBackgroundTokenRefresh();
+    exit;
+}
 
 /* ─── Helpers ─── */
 function generateUUID() {
@@ -120,25 +128,15 @@ function triggerBackgroundTokenRefresh() {
     // Create lock file
     file_put_contents(LOCK_FILE, time(), LOCK_EX);
 
-    // Spawn background process (async)
-    $cmd = 'php -r "require_once \'' . __FILE__ . '\'; doBackgroundTokenRefresh();" > /dev/null 2>&1 &';
-    if (function_exists('fastcgi_finish_request')) {
-        // Finish the current request first, then execute in the same process? No, we need to fork.
-        // We'll use exec to run a separate process.
-        exec($cmd);
-    } else {
-        // Fallback: use exec anyway.
-        exec($cmd);
-    }
-    // The lock will be removed by the background process when done.
+    // Spawn background process (async) – now correctly calls only the refresh function
+    $cmd = 'php -d display_errors=0 -r "define(\'BACKGROUND_TOKEN_REFRESH\', true); require_once \'' . __FILE__ . '\';" > /dev/null 2>&1 &';
+    exec($cmd);
 }
 
 /**
  * Background task – called by the spawned process.
- * This function is not exposed to the web; it's invoked via CLI.
  */
 function doBackgroundTokenRefresh() {
-    // Prevent timeout
     set_time_limit(30);
     $lockFile = LOCK_FILE;
 
@@ -149,7 +147,6 @@ function doBackgroundTokenRefresh() {
     if ($newToken) {
         saveTokenCache($newToken);
     }
-    // Remove lock regardless of success
     @unlink($lockFile);
 }
 
@@ -246,11 +243,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 $channelId = getChannelIdFromRequest();
+
+// HEALTH CHECK – responds 200 when no channel ID is given (e.g. cron keep‑alive)
 if (!$channelId) {
-    http_response_code(400);
     setCorsHeaders();
     header('Content-Type: application/json');
-    echo json_encode(["error" => "Channel ID required. Use /{id}.m3u8 or ?id=CHANNEL_ID"]);
+    http_response_code(200);
+    echo json_encode(["status" => "ok", "message" => "Server is running"]);
     exit;
 }
 
