@@ -1,7 +1,7 @@
 <?php
 /* ─── Configuration ─── */
 define('TOKEN_CACHE_FILE', __DIR__ . '/token_cache.json');
-define('TOKEN_REFRESH_INTERVAL', 600);          // 10 minutes
+define('TOKEN_REFRESH_INTERVAL', 600);          // 10 minute
 define('PLAYABLE_URL_CACHE_TTL', 120);          // 2 minutes – balances freshness & speed
 define('LOCK_FILE', __DIR__ . '/token_refresh.lock');
 
