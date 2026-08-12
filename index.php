@@ -1,289 +1,139 @@
 <?php
-/* ─── Configuration ─── */
-define('TOKEN_CACHE_FILE', __DIR__ . '/token_cache.json');
-define('TOKEN_REFRESH_INTERVAL', 600);          // 10 minute
-define('PLAYABLE_URL_CACHE_TTL', 120);          // 2 minutes – balances freshness & speed
-define('LOCK_FILE', __DIR__ . '/token_refresh.lock');
-
-/* ─── Helpers ─── */
-function generateUUID() {
-    $data = random_bytes(16);
-    $data[6] = chr(ord($data[6]) & 0x0f | 0x40);
-    $data[8] = chr(ord($data[8]) & 0x3f | 0x80);
-    return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
-}
+// Set header so the browser/client reads the output as JSON
+header('Content-Type: application/json');
 
 function generateDDToken() {
     return base64_encode(json_encode([
-        'schema_version'       => '1',
-        'os_name'              => 'N/A',
-        'os_version'           => 'N/A',
-        'platform_name'        => 'Chrome',
-        'platform_version'     => '104',
-        'device_name'          => '',
-        'app_name'             => 'Web',
-        'app_version'          => '2.52.31',
-        'player_capabilities'  => [
-            'audio_channel'  => ['STEREO'],
-            'video_codec'    => ['H264'],
-            'container'      => ['MP4', 'TS'],
-            'package'        => ['DASH', 'HLS'],
-            'resolution'     => ['240p', 'SD', 'HD', 'FHD'],
-            'dynamic_range'  => ['SDR']
+        'schema_version' => '1',
+        'os_name' => 'N/A',
+        'os_version' => 'N/A',
+        'platform_name' => 'Chrome',
+        'platform_version' => '104',
+        'device_name' => '',
+        'app_name' => 'Web',
+        'app_version' => '2.52.31',
+        'player_capabilities' => [
+            'audio_channel' => ['STEREO'],
+            'video_codec' => ['H264'],
+            'container' => ['MP4', 'TS'],
+            'package' => ['DASH', 'HLS'],
+            'resolution' => ['240p', 'SD', 'HD', 'FHD'],
+            'dynamic_range' => ['SDR']
         ],
         'security_capabilities' => [
-            'encryption'            => ['WIDEVINE_AES_CTR'],
-            'widevine_security_level'=> ['L3'],
-            'hdcp_version'          => ['HDCP_V1', 'HDCP_V2', 'HDCP_V2_1', 'HDCP_V2_2']
+            'encryption' => ['WIDEVINE_AES_CTR'],
+            'widevine_security_level' => ['L3'],
+            'hdcp_version' => ['HDCP_V1', 'HDCP_V2', 'HDCP_V2_1', 'HDCP_V2_2']
         ]
     ]));
 }
 
-/* ─── Token management (non‑blocking) ─── */
-
-/**
- * Returns the cached token instantly.
- * If the token is missing, fetches it synchronously (only once).
- */
-function getPlatformToken() {
-    $cache = loadTokenCache();
-    if ($cache && !empty($cache['token'])) {
-        // If token is stale, trigger a background refresh (but still return old token)
-        if ((time() - $cache['fetched_at']) >= TOKEN_REFRESH_INTERVAL) {
-            triggerBackgroundTokenRefresh();
-        }
-        return $cache['token'];
-    }
-
-    // No token at all – fetch synchronously (first run)
-    $token = fetchTokenFromApi();
-    if ($token) {
-        saveTokenCache($token);
-        return $token;
-    }
-    return null;
+function generateGuestToken() {
+    $bin = bin2hex(random_bytes(16));
+    return substr($bin, 0, 8) . '-' .
+           substr($bin, 8, 4) . '-' .
+           substr($bin, 12, 4) . '-' .
+           substr($bin, 16, 4) . '-' .
+           substr($bin, 20);
 }
 
-/**
- * Loads token cache from file.
- */
-function loadTokenCache() {
-    if (!file_exists(TOKEN_CACHE_FILE)) return null;
-    $data = file_get_contents(TOKEN_CACHE_FILE);
-    return json_decode($data, true);
-}
-
-/**
- * Saves token to cache file.
- */
-function saveTokenCache($token) {
-    $data = ['token' => $token, 'fetched_at' => time()];
-    file_put_contents(TOKEN_CACHE_FILE, json_encode($data), LOCK_EX);
-}
-
-/**
- * Fetches a new token from the API (blocking call).
- * Used only during background refresh or first‑time sync.
- */
-function fetchTokenFromApi() {
-    $ch = curl_init('https://jiotvegp.vercel.app/api/token');
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 10,
-        CURLOPT_HTTPHEADER     => ['Accept: application/json'],
-        CURLOPT_USERAGENT      => 'Mozilla/5.0'
-    ]);
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    if ($httpCode !== 200 || empty($response)) return null;
-    $data = json_decode($response, true);
-    if ($data['success'] && !empty($data['token'])) {
-        return $data['token'];
+// MODIFIED: Only accepts the token dynamically from the URL, skips page parsing completely.
+function fetchPlatformToken() {
+    if (isset($_GET['tok']) && !empty($_GET['tok'])) {
+        return $_GET['tok'];
     }
-    return null;
+    
+    // If no token is provided in the URL, stop execution and show this error.
+    echo json_encode(["error" => "Missing gwapiPlatformToken. Please pass it in the URL like: This.php?tok=YOUR_TOKEN_HERE"]);
+    exit;
 }
 
-/**
- * Triggers a background token refresh if not already running.
- * Uses a lock file to prevent multiple concurrent refreshes.
- */
-function triggerBackgroundTokenRefresh() {
-    // Already refreshing? Skip.
-    if (file_exists(LOCK_FILE)) {
-        $lockAge = time() - filemtime(LOCK_FILE);
-        if ($lockAge < 60) return; // assume refresh is still ongoing
-        // If lock is older than 60s, it's stale – remove it and proceed
-        @unlink(LOCK_FILE);
-    }
-
-    // Create lock file
-    file_put_contents(LOCK_FILE, time(), LOCK_EX);
-
-    // Spawn background process (async)
-    $cmd = 'php -r "require_once \'' . __FILE__ . '\'; doBackgroundTokenRefresh();" > /dev/null 2>&1 &';
-    if (function_exists('fastcgi_finish_request')) {
-        // Finish the current request first, then execute in the same process? No, we need to fork.
-        // We'll use exec to run a separate process.
-        exec($cmd);
-    } else {
-        // Fallback: use exec anyway.
-        exec($cmd);
-    }
-    // The lock will be removed by the background process when done.
-}
-
-/**
- * Background task – called by the spawned process.
- * This function is not exposed to the web; it's invoked via CLI.
- */
-function doBackgroundTokenRefresh() {
-    // Prevent timeout
-    set_time_limit(30);
-    $lockFile = LOCK_FILE;
-
-    // Double‑check lock (should exist)
-    if (!file_exists($lockFile)) return;
-
-    $newToken = fetchTokenFromApi();
-    if ($newToken) {
-        saveTokenCache($newToken);
-    }
-    // Remove lock regardless of success
-    @unlink($lockFile);
-}
-
-/* ─── Playable URL with caching ─── */
-
-function fetchFreshPlayableUrl($channelId) {
-    $deviceId   = generateUUID();
-    $guestToken = $deviceId;
-    $platformToken = getPlatformToken(); // non‑blocking
-    if (!$platformToken) return null;
-
-    $queryParams = http_build_query([
-        'channel_id'              => $channelId,
-        'device_id'               => $deviceId,
-        'platform_name'           => 'mobile_web',
-        'translation'             => 'en',
-        'user_language'           => 'en,hi,hr,mr',
-        'country'                 => 'IN',
-        'state'                   => '',
-        'app_version'             => '6.5.12',
-        'user_type'               => 'guest',
-        'check_parental_control'  => 'false',
-        'uid'                     => 'Z5X_' . $deviceId,
-        'ppid'                    => $deviceId,
-        'version'                 => '15',
-        'os'                      => 'android'
-    ]);
-
-    $url = 'https://spapi.zee5.com/singlePlayback/getDetails/secure?' . $queryParams;
+function fetchM3U8url() {
+    $guestToken = generateGuestToken();
+    $platformToken = fetchPlatformToken();
+    
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL            => $url,
+        CURLOPT_URL => 'https://spapi.zee5.com/singlePlayback/getDetails/secure?channel_id=0-9-zeenews&device_id=' . $guestToken . '&platform_name=desktop_web&translation=en&user_language=en,hi,te&country=IN&state=&app_version=4.24.0&user_type=guest&check_parental_control=false',
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_CUSTOMREQUEST  => 'POST',
-        CURLOPT_HTTPHEADER     => [
+        CURLOPT_CUSTOMREQUEST => 'POST',
+        CURLOPT_HTTPHEADER => [
             'accept: application/json',
             'content-type: application/json',
             'origin: https://www.zee5.com',
             'referer: https://www.zee5.com/',
-            'user-agent: Mozilla/5.0'
+            'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
         ],
         CURLOPT_POSTFIELDS => json_encode([
-            'x-access-token'   => $platformToken,
+            'x-access-token' => $platformToken,
             'X-Z5-Guest-Token' => $guestToken,
-            'x-dd-token'       => generateDDToken()
+            'x-dd-token' => generateDDToken()
         ])
     ]);
+    
     $response = curl_exec($ch);
     curl_close($ch);
-    $data = json_decode($response, true);
-    return $data['keyOsDetails']['video_token'] ?? null;
-}
-
-function getCachedPlayableUrl($channelId) {
-    $cacheFile = __DIR__ . '/tmp/playable_' . md5($channelId) . '.cache';
-    // Create tmp dir if missing
-    if (!is_dir(__DIR__ . '/tmp')) mkdir(__DIR__ . '/tmp', 0755, true);
-
-    if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < PLAYABLE_URL_CACHE_TTL) {
-        return file_get_contents($cacheFile);
-    }
-    $freshUrl = fetchFreshPlayableUrl($channelId);
-    if ($freshUrl) {
-        file_put_contents($cacheFile, $freshUrl, LOCK_EX);
-        return $freshUrl;
-    }
-    // If fetch fails, return stale cache if exists
-    return file_exists($cacheFile) ? file_get_contents($cacheFile) : null;
-}
-
-/* ─── Request helpers ─── */
-
-function getChannelIdFromRequest() {
-    $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-    if (preg_match('#/([a-zA-Z0-9\-_]+)\.m3u8$#', $path, $m)) {
-        return $m[1];
-    }
-    return $_GET['id'] ?? null;
-}
-
-function setCorsHeaders() {
-    header('Access-Control-Allow-Origin: *');
-    header('Access-Control-Allow-Methods: GET, OPTIONS');
-    header('Access-Control-Allow-Headers: *');
-}
-
-/* ─── Main ─── */
-
-// CORS preflight
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    setCorsHeaders();
-    http_response_code(204);
-    exit;
-}
-
-$channelId = getChannelIdFromRequest();
-if (!$channelId) {
-    http_response_code(400);
-    setCorsHeaders();
-    header('Content-Type: application/json');
-    echo json_encode(["error" => "Channel ID required. Use /{id}.m3u8 or ?id=CHANNEL_ID"]);
-    exit;
-}
-
-// If request ends with .m3u8 → redirect to Akamai (fast)
-if (preg_match('#\.m3u8$#', $_SERVER['REQUEST_URI'] ?? '')) {
-    $playableUrl = getCachedPlayableUrl($channelId);
-    if (!$playableUrl) {
-        http_response_code(502);
-        setCorsHeaders();
-        echo 'Failed to obtain stream URL';
+    $responseData = json_decode($response, true);
+    
+    if (!$responseData) {
+        echo json_encode(["error" => "Invalid response received from API. IP is likely blocked."]);
         exit;
     }
-    setCorsHeaders();
-    header('Referrer-Policy: no-referrer');
-    header('Cache-Control: no-store');
-    header('Location: ' . $playableUrl, true, 302);
+
+    if (isset($responseData['keyOsDetails']['video_token'])) {
+        if (!filter_var($responseData['keyOsDetails']['video_token'], FILTER_VALIDATE_URL)) {
+            echo json_encode(["error" => "Invalid URL received."]);
+            exit;
+        }
+        return [
+            'm3u8_url' => $responseData['keyOsDetails']['video_token'],
+            'post_api_response' => $responseData 
+        ];
+    } else {
+        echo json_encode(["error" => "Could not fetch m3u8 URL", "raw_response" => $responseData]);
+        exit;
+    }
+}
+
+function generateCookieZee5($userAgent) {
+    $fetchedData = fetchM3U8url();
+    $m3u8Url = $fetchedData['m3u8_url'];
+    $apiResponse = $fetchedData['post_api_response'];
+    
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $m3u8Url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_USERAGENT => $userAgent,
+        CURLOPT_FOLLOWLOCATION => true
+    ]);
+    $result = curl_exec($ch);
+    $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    
+    if ($httpcode !== 200) {
+        echo json_encode(["error" => "Required hdntl token can't be extracted. IP blocked at Akamai CDN level."]);
+        exit;
+    }
+    
+    if (preg_match('/hdntl=([^\s"]+)/', $result, $matches)) {
+        return [
+            'status' => 'success',
+            'extracted_cookie' => $matches[0],
+            'm3u8_master_url' => $m3u8Url,
+            'zee5_api_response' => $apiResponse 
+        ];
+    }
+    
+    echo json_encode(["error" => "Something went wrong. hdntl cookie not found in the m3u8 text."]);
     exit;
 }
 
-// ?id= → JSON debug (CORS enabled)
-$playableUrl = getCachedPlayableUrl($channelId);
-if (!$playableUrl) {
-    http_response_code(502);
-    setCorsHeaders();
-    header('Content-Type: application/json');
-    echo json_encode(["error" => "Could not fetch playable URL."]);
-    exit;
-}
+// === EXECUTION BLOCK ===
+$userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36';
 
-setCorsHeaders();
-header('Content-Type: application/json');
-echo json_encode([
-    'status'           => 'success',
-    'playable_redirect'=> $playableUrl
-]);
+$finalOutput = generateCookieZee5($userAgent);
+
+echo json_encode($finalOutput, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
 exit;
+?>
