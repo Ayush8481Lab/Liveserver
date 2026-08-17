@@ -2,7 +2,7 @@
 /* ─── Configuration ─── */
 define('TOKEN_CACHE_FILE', __DIR__ . '/token_cache.json');
 define('TOKEN_REFRESH_INTERVAL', 10800);         // 3 hours – token is valid for at least 3 hours
-define('PLAYABLE_URL_CACHE_TTL', 1500);          // 25 minutes – stream URL is valid 40‑60 minutes
+define('PLAYABLE_URL_CACHE_TTL', 500);          // 25 minutes – stream URL is valid 40‑60 minutes
 define('LOCK_FILE', __DIR__ . '/token_refresh.lock');
 
 /* ─── Background token refresh guard ───
